@@ -1,11 +1,12 @@
 import requests
 import json
 import urllib3
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Query
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
+from mangum import Mangum
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -14,6 +15,7 @@ app = FastAPI(
     title="Kirotools API",
     description="UID live checker API by Kirotools",
     version="1.0.0",
+    root_path="",
 )
 
 app.add_middleware(
@@ -61,7 +63,7 @@ def fetch_from_hitools(uids: List[str], csrf: str, cb_url: str) -> List[dict]:
         headers=UPSTREAM_HEADERS,
         cookies=cookies,
         json={"uids": uids},
-        timeout=30,
+        timeout=25,
         verify=False,
     )
     resp.raise_for_status()
@@ -80,9 +82,11 @@ def root():
         "api": "Kirotools API",
         "version": "1.0.0",
         "endpoints": {
-            "POST /api/check-live-uid": "Check if Facebook UIDs are live",
-            "GET  /api/health":         "Health check",
-            "GET  /docs":               "Swagger UI",
+            "GET  /api/checkliveuid?uid=UID":           "Check single UID (query param)",
+            "GET  /api/checkliveuid?uid=UID1&uid=UID2": "Check multiple UIDs (query param)",
+            "POST /api/check-live-uid":                 "Check UIDs (JSON body)",
+            "GET  /api/health":                         "Health check",
+            "GET  /docs":                               "Swagger UI",
         }
     }
 
@@ -90,18 +94,47 @@ def root():
 def health():
     return {"status": "ok", "service": "kirotools-api"}
 
+
+# ── GET  /api/checkliveuid?uid=123&uid=456 ───────────────────────────────────
+@app.get("/api/checkliveuid")
+def check_live_uid_get(
+    uid: List[str] = Query(..., description="One or more Facebook UIDs to check"),
+):
+    """
+    Check UIDs via query params.
+
+    **Examples:**
+    - Single:   `/api/checkliveuid?uid=100078365118623`
+    - Multiple: `/api/checkliveuid?uid=100078365118623&uid=987654321`
+    """
+    if not uid:
+        raise HTTPException(status_code=400, detail="At least one uid param is required")
+
+    try:
+        results = fetch_from_hitools(uid, DEFAULT_CSRF, DEFAULT_CB_URL)
+        return JSONResponse(content=results)
+
+    except requests.exceptions.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Upstream HTTP error: {str(e)}")
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=503, detail=f"Upstream request failed: {str(e)}")
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=502, detail=f"Failed to parse upstream response: {str(e)}")
+
+
+# ── POST /api/check-live-uid (JSON body, kept for compatibility) ──────────────
 @app.post("/api/check-live-uid")
-def check_live_uid(
+def check_live_uid_post(
     body: CheckUIDRequest,
     x_csrf_token:   Optional[str] = Header(default=None, alias="X-CSRF-Token"),
     x_callback_url: Optional[str] = Header(default=None, alias="X-Callback-URL"),
 ):
     """
-    Check whether Facebook UIDs are live or dead.
+    Check UIDs via JSON body.
 
-    - **uids**: list of UID strings to check
-    - **X-CSRF-Token** *(optional)*: override default CSRF token
-    - **X-Callback-URL** *(optional)*: override default callback URL
+    ```json
+    { "uids": ["100078365118623", "987654321"] }
+    ```
     """
     if not body.uids:
         raise HTTPException(status_code=400, detail="uids list cannot be empty")
@@ -120,6 +153,6 @@ def check_live_uid(
     except json.JSONDecodeError as e:
         raise HTTPException(status_code=502, detail=f"Failed to parse upstream response: {str(e)}")
 
+
 # ── Vercel Serverless Handler ─────────────────────────────────────────────────
-from mangum import Mangum
 handler = Mangum(app, lifespan="off")
